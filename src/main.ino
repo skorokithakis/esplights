@@ -1,28 +1,45 @@
-// MQTT library: http://github.com/Imroy/pubsubclient
 #include "PubSubClient.h"
+#include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <DHT.h>
+#include "transmit.h"
 
-#define SSID "MyWiFi"
-#define WIFI_PASS "the wifi password of my wifi"
-#define OTA_PASS "the password for OTA updates"
+#ifndef WIFI_SSID
+#define WIFI_SSID "your ssid"
+#endif
+
+#ifndef WIFI_PASS
+#define WIFI_PASS "your wifi password"
+#endif
+
+#ifndef OTA_PASS
+#define OTA_PASS "an ota pass"
+#endif
 
 #define MQTT_ENABLED 1
+
+#ifndef MQTT_SERVER
 #define MQTT_SERVER "test.mosquitto.org"
+#endif
+
 #define MQTT_PORT 1883
+
+#ifndef NTP_SERVER
+#define NTP_SERVER "pool.ntp.org"
+#endif
 
 #define ACTIVE_MOTION_THRESHOLD 10 * 60
 #define LIGHT_ON_THRESHOLD 90
 #define LIGHT_OFF_THRESHOLD 200
 
-#define MOTION_PIN D1
+#define MOTION_PIN D7
 #define TEMPERATURE_PIN D6
 #define LED_PIN D4
 #define LED2_PIN D0
-#define RF_PIN D2
+#define RF_PIN D1
 #define ALARM_PIN D5
 #define LIGHT_PIN A0
 
@@ -31,14 +48,19 @@
 #define MAX_MESSAGE_LENGTH 600
 #define DELAY_MULTIPLIER 100
 #define UNAUTO_DELAY 13 * 60 * 60L
-#define CPU_LATENCY 1
+
+#define CONFIG_VERSION "cf1"
 
 WiFiClient wclient;
+char COMMAND_CHANNEL[] = "esplights_command";
+char STATE_CHANNEL[] = "esplights_state";
+char LOG_CHANNEL[] = "esplights_log";
+String NAME = "esplights1";
 
 enum {OTA, CONNECTING_WIFI, CONNECTING_MQTT, CONNECTED} state = CONNECTING_WIFI;
 
 #if MQTT_ENABLED == 1
-PubSubClient client(wclient, MQTT_SERVER, MQTT_PORT);
+PubSubClient client(wclient);
 #endif
 
 struct Sensors {
@@ -50,18 +72,22 @@ struct Sensors {
     unsigned int lightLevel = 0;
 } sensors;
 
+struct Persistent {
+    char version[4] = CONFIG_VERSION;
+    unsigned long autoDisableTime = 0;
+    char automation = 1;
+} persistent;
+
 struct Misc {
     unsigned int lastUpdate = 0;
     unsigned int lastShow = 0;
     unsigned int alarm = 0;
-    unsigned long autoDisabledTime = 0;
-    char automation = 1;
+    unsigned long bootTime = 0;
     char lampState = 0;
 } misc;
 
-// The RF timings for turning the lamp on and off, in big-endian 2-byte ints.
-unsigned char messageOn[] = {2, 134, 4, 247, 2, 155, 4, 226};
-unsigned char messageOff[] = {2, 175, 4, 163, 5, 53, 2, 50};
+unsigned char messageOn[] = {2, 113, 2, 113, 5, 32, 2, 113, 5, 12, 2, 113, 5, 12, 2, 113, 5, 32, 2, 113, 5, 12, 2, 134, 5, 12, 2, 113, 5, 12, 2, 134, 4, 247, 2, 155, 4, 247, 2, 134, 4, 247, 2, 134, 5, 12, 2, 134, 4, 247, 2, 155, 4, 226, 5, 12, 2, 92, 2, 155, 4, 205, 5, 12, 2, 92, 2, 155, 4, 247, 2, 134, 4, 247, 2, 134, 4, 247, 2, 155, 4, 226};
+unsigned char messageOff[] = {2, 113, 2, 113, 5, 32, 2, 113, 5, 12, 2, 113, 5, 32, 2, 92, 5, 32, 2, 134, 5, 12, 2, 113, 5, 12, 2, 113, 5, 12, 2, 134, 4, 247, 2, 155, 4, 247, 2, 134, 5, 12, 2, 134, 4, 247, 2, 134, 4, 247, 2, 155, 4, 247, 5, 53, 2, 71, 2, 155, 4, 247, 2, 134, 4, 247, 2, 155, 4, 226, 2, 155, 4, 205, 2, 175, 4, 163, 5, 53, 2, 50};
 
 
 // Publish a message to MQTT if connected.
@@ -70,18 +96,16 @@ void mqttPublish(String topic, String payload) {
     if (!client.connected()) {
         return;
     }
-    client.publish(topic, payload);
+    client.publish(topic.c_str(), payload.c_str());
 #endif
 }
 
 
 // Receive a message from MQTT and act on it.
 #if MQTT_ENABLED == 1
-void mqttCallback(const MQTT::Publish& pub) {
-    unsigned char cPayload[MAX_MESSAGE_LENGTH];
-    String payload = pub.payload_string();
-
-    payload.toCharArray((char *)cPayload, MAX_MESSAGE_LENGTH);
+void mqttCallback(char* chTopic, byte* chPayload, unsigned int length) {
+    chPayload[length] = '\0';
+    String payload = String((char*)chPayload);
 
     if (payload == "auto on") {
         enableAuto(1);
@@ -89,94 +113,15 @@ void mqttCallback(const MQTT::Publish& pub) {
         enableAuto(0);
     } else if (payload == "alarm on") {
         misc.alarm = 1;
-        digitalWrite(ALARM_PIN, LOW);
+        digitalWrite(ALARM_PIN, HIGH);
     } else if (payload == "alarm off") {
         misc.alarm = 0;
-        digitalWrite(ALARM_PIN, HIGH);
+        digitalWrite(ALARM_PIN, LOW);
     } else if (payload[0] == 1) {
-        cmdSend(cPayload[3], &cPayload[6], cPayload[4], cPayload[5] * DELAY_MULTIPLIER, cPayload[1] - 1,  cPayload[2] - 1);
+        cmdSend(chPayload[3], &chPayload[6], chPayload[4], chPayload[5] * DELAY_MULTIPLIER, chPayload[1] - 1,  chPayload[2] - 1);
     }
 }
 #endif
-
-
-// Transmit a command.
-// pin: The pin to transmit to.
-// message[[]: The 2-byte timings to send.
-// repeat: How many times to repeat the message.
-// intraDelay: How long to wait between repeats.
-// dcHigh: How long the high duty cycle is (in microseconds).
-//         Anything over 24 means 100% duty cycle. Will have a constant
-//         added to it due to processing latency.
-// dcLow: How long the low duty cycle is (in microseconds).
-void transmit(char pin, unsigned char message[], unsigned char repeat, unsigned int intraDelay, unsigned char dcHigh, unsigned char dcLow) {
-    int status = LOW;
-    unsigned int out = 0;
-    unsigned int i, j;
-    unsigned int k;
-    unsigned int dcTotal = dcHigh + dcLow;
-    bool carrier = true;
-
-    // Compensate for CPU latency.
-
-    if (dcHigh < CPU_LATENCY) {
-        dcHigh = 0;
-    } else {
-        dcHigh = dcHigh - CPU_LATENCY;
-    }
-
-    if (dcLow < CPU_LATENCY) {
-        dcLow = 0;
-    } else {
-        dcLow = dcLow - CPU_LATENCY;
-    }
-
-    Serial.print("PIN: ");
-    Serial.println(pin, DEC);
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
-
-    if (dcLow == 0) {
-        // If the low time is 0, there's no carrier frequency.
-        carrier = false;
-    }
-
-    // Send the message.
-    for (j = 0; j < repeat; j++) {
-        for (i = 0; i < MAX_MESSAGE_LENGTH; i = i + 2) {
-            if (message[i] == 0 || message[i+1] == 0) {
-                break;
-            }
-
-            // Convert two bytes to an int.
-            out = (message[i] << 8) + message[i+1];
-            if (status == HIGH) {
-                status = LOW;
-                digitalWrite(pin, status);
-                delayMicroseconds(out);
-            } else {
-                status = HIGH;
-                if (carrier) {
-                    // Loop, once per pulse.
-                    for (k = 0; k < out / dcTotal; k++) {
-                        digitalWrite(pin, HIGH);
-                        delayMicroseconds(dcHigh);
-                        digitalWrite(pin, LOW);
-                        delayMicroseconds(dcLow);
-                    }
-                } else {
-                    digitalWrite(pin, status);
-                    delayMicroseconds(out);
-                }
-            }
-        }
-
-        // Reset, just in case.
-        digitalWrite(pin, LOW);
-        delayMicroseconds(intraDelay);
-        yield();
-    }
-}
 
 
 // Send a command, printing some debug information.
@@ -217,19 +162,108 @@ void cmdSend(char pin, unsigned char message[], unsigned char repeat, unsigned i
 }
 
 
+unsigned long getNTPTime() {
+    IPAddress address;
+    WiFiUDP udp;
+    const int NTP_PACKET_SIZE = 48;
+    byte packetBuffer[NTP_PACKET_SIZE];
+
+    udp.begin(2390);
+    // set all bytes in the buffer to 0
+    memset(packetBuffer, 0, NTP_PACKET_SIZE);
+    // Initialize values needed to form NTP request
+    // (see URL above for details on the packets)
+    packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+    packetBuffer[1] = 0;     // Stratum, or type of clock
+    packetBuffer[2] = 6;     // Polling Interval
+    packetBuffer[3] = 0xEC;  // Peer Clock Precision
+    // 8 bytes of zero for Root Delay & Root Dispersion
+    packetBuffer[12]  = 49;
+    packetBuffer[13]  = 0x4E;
+    packetBuffer[14]  = 49;
+    packetBuffer[15]  = 52;
+
+    // all NTP fields have been given values, now
+    // you can send a packet requesting a timestamp:
+    WiFi.hostByName(NTP_SERVER, address);
+    udp.beginPacket(address, 123); //NTP requests are to port 123
+    udp.write(packetBuffer, NTP_PACKET_SIZE);
+    udp.endPacket();
+
+    delay(1000);
+
+    int cb = udp.parsePacket();
+    if (!cb) {
+        return 0;
+    } else {
+        udp.read(packetBuffer, NTP_PACKET_SIZE);
+        unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+        unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+        unsigned long secsSince1900 = highWord << 16 | lowWord;
+        const unsigned long seventyYears = 2208988800UL;
+        unsigned long epoch = secsSince1900 - seventyYears;
+        return epoch;
+    }
+}
+
+
+void resetPins() {
+    pinMode(1, OUTPUT);
+    digitalWrite(1, LOW);
+    pinMode(2, OUTPUT);
+    digitalWrite(2, LOW);
+    pinMode(3, OUTPUT);
+    digitalWrite(3, LOW);
+    pinMode(4, OUTPUT);
+    digitalWrite(4, LOW);
+    pinMode(5, OUTPUT);
+    digitalWrite(5, LOW);
+    pinMode(12, OUTPUT);
+    digitalWrite(12, LOW);
+    pinMode(13, OUTPUT);
+    digitalWrite(13, LOW);
+    pinMode(14, OUTPUT);
+    digitalWrite(14, LOW);
+    pinMode(15, OUTPUT);
+    digitalWrite(15, LOW);
+}
+
+void loadState() {
+    if (EEPROM.read(0) == CONFIG_VERSION[0] &&
+        EEPROM.read(1) == CONFIG_VERSION[1] &&
+        EEPROM.read(2) == CONFIG_VERSION[2]) {
+        for (unsigned int t=0; t<sizeof(persistent); t++)
+            *((char*)&persistent + t) = EEPROM.read(t);
+    }
+}
+
+
+void saveState() {
+    for (unsigned int t=0; t<sizeof(persistent); t++)
+        EEPROM.write(t, *((char*)&persistent + t));
+    EEPROM.commit();
+}
+
+
+unsigned long currentTime() {
+    return misc.bootTime + (millis() / 1000);
+}
+
+
 // Enable or disable automation.
 void enableAuto(char enable) {
     if (enable == 0) {
-        misc.autoDisabledTime = millis() / 1000;
+        persistent.autoDisableTime = currentTime() + UNAUTO_DELAY;
     } else {
-        misc.autoDisabledTime = 0;
+        persistent.autoDisableTime = 0;
     }
-    misc.automation = enable;
+    persistent.automation = enable;
+    saveState();
 }
 
 
 void checkTimers() {
-    if ((misc.automation == 0) && (((millis() / 1000) - misc.autoDisabledTime) > UNAUTO_DELAY)) {
+    if ((persistent.automation == 0) && ((currentTime() > persistent.autoDisableTime))) {
         enableAuto(1);
     }
 }
@@ -245,10 +279,9 @@ String sensorState() {
                   "\"TEMPERATURE\": " + String(sensors.temperature, DEC) + ",\n" +
                   "\"LIGHT_LEVEL\": " + String(sensors.lightLevel, DEC) + ",\n" +
                   "\"LAMP_STATE\": " + String(misc.lampState, DEC) + ",\n" +
-                  "\"AUTOMATION\": " + String(misc.automation, DEC) + ",\n" +
-                  "\"AUTO_DISABLED_TIME\": " + String(misc.autoDisabledTime, DEC) + ",\n" +
-                  "\"SECS\": " + String(millis() / 1000, DEC) + ",\n" +
-                  "\"UNAUTO_DELAY\": " + String(UNAUTO_DELAY, DEC) + "\n" +
+                  "\"AUTOMATION\": " + String(persistent.automation, DEC) + ",\n" +
+                  "\"AUTO_DISABLE_TIME\": " + String(persistent.autoDisableTime, DEC) + ",\n" +
+                  "\"CURRENT_TIME\": " + String(currentTime(), DEC) + ",\n" +
                   "}\n");
 }
 
@@ -258,7 +291,7 @@ void decide() {
     unsigned long lastMotionSec = (millis() / 1000) - sensors.motionTime;
     unsigned int lightLevel = analogRead(LIGHT_PIN);
 
-    if (misc.automation == 0) {
+    if (persistent.automation == 0) {
         // Do nothing if we aren't managing the thing.
         return;
     }
@@ -268,19 +301,19 @@ void decide() {
             (misc.lampState == 0)) {
         // Turn on if motion is detected and there is no light.
         cmdSend(RF_PIN, messageOn, 3, 10000, 0, 0);
-        misc.lampState  = 1;
-        mqttPublish("esplights_log", "Turning on...");
+        misc.lampState = 1;
+        mqttPublish(LOG_CHANNEL, "Turning on...");
     } else if ((lastMotionSec >= ACTIVE_MOTION_THRESHOLD) &&
-               (misc.lampState  == 1)) {
+               (misc.lampState == 1)) {
         // Turn off if motion is not detected for some time.
         cmdSend(RF_PIN, messageOff, 3, 10000, 0, 0);
-        misc.lampState  = 0;
-        mqttPublish("esplights_log", "Turning off because of motion...");
-    } else if ((sensors.lightLevel > LIGHT_OFF_THRESHOLD) && (misc.lampState  == 1)) {
+        misc.lampState = 0;
+        mqttPublish(LOG_CHANNEL, "Turning off because of motion...");
+    } else if ((sensors.lightLevel > LIGHT_OFF_THRESHOLD) && (misc.lampState == 1)) {
         // Turn off if other lights are turned on.
         cmdSend(RF_PIN, messageOff, 3, 10000, 0, 0);
-        misc.lampState  = 0;
-        mqttPublish("esplights_log", "Turning off because of lights...");
+        misc.lampState = 0;
+        mqttPublish(LOG_CHANNEL, "Turning off because of lights...");
     }
 }
 
@@ -288,6 +321,9 @@ void decide() {
 // Update the sensors to their latest values.
 void updateSensors() {
     char motionInput = 0;
+
+    motionInput = digitalRead(MOTION_PIN);
+    digitalWrite(LED_PIN, !motionInput);
 
     // Check last update.
     if (millis() > misc.lastUpdate + UPDATE_INTERVAL_MS) {
@@ -297,7 +333,7 @@ void updateSensors() {
     }
 
     // Check motion.
-    motionInput = digitalRead(MOTION_PIN);
+    Serial.println(motionInput, DEC);
 
     if (motionInput) {
         sensors.motionTime = millis() / 1000;
@@ -329,7 +365,7 @@ void publishState() {
         return;
     }
 
-    mqttPublish("esplights_state", sensorState());
+    mqttPublish(STATE_CHANNEL, sensorState());
 }
 
 
@@ -346,10 +382,10 @@ void connectMQTT() {
 
         int retries = 4;
         Serial.println("\nConnecting to MQTT...");
-        while (!client.connect(MQTT::Connect("esplights").set_auth("", "")) && retries--) {
+        while (!client.connect(NAME.c_str()) && retries--) {
             delay(500);
+            Serial.println("Retry...");
         }
-
 
         if (!client.connected()) {
             Serial.println("\nfatal: MQTT server connection failed. Rebooting.");
@@ -357,7 +393,8 @@ void connectMQTT() {
             ESP.restart();
         }
 
-        client.subscribe("esplights_command");
+        Serial.println("Connected.");
+        client.subscribe(COMMAND_CHANNEL);
     }
 #endif
 }
@@ -370,7 +407,7 @@ void connectWifi() {
 
         WiFi.mode(WIFI_STA);
         while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-            WiFi.begin(SSID, WIFI_PASS);
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
             Serial.println("Connecting to wifi...");
         }
 
@@ -383,7 +420,10 @@ void connectWifi() {
 
 
 void setup() {
+    resetPins();
     Serial.begin(115200);
+    EEPROM.begin(32);
+    loadState();
 
     pinMode(MOTION_PIN, INPUT);
     pinMode(LIGHT_PIN, INPUT);
@@ -395,18 +435,19 @@ void setup() {
     digitalWrite(ALARM_PIN, LOW);
 
 #if MQTT_ENABLED == 1
-    client.set_callback(mqttCallback);
+    client.setServer(MQTT_SERVER, MQTT_PORT);
+    client.setCallback(mqttCallback);
 #endif
 
     connectWifi();
-
-    Serial.println("\nConnected to Wifi.");
-
     connectMQTT();
     state = CONNECTED;
 
+    misc.bootTime = getNTPTime() - (millis() / 1000);
+
     // Enable OTA updates.
     ArduinoOTA.setPassword((const char *) OTA_PASS);
+    ArduinoOTA.setHostname("ESPlights");
 
     ArduinoOTA.onStart([]() {
             Serial.println("Start");
@@ -431,8 +472,6 @@ void setup() {
 
 
 void loop() {
-    digitalWrite(LED_PIN, !digitalRead(MOTION_PIN));
-
     connectWifi();
     connectMQTT();
 
